@@ -33,28 +33,7 @@ check_tool() {
 }
 
 current_version() {
-    local version
-    version=$(grep -E '^VERSION *= *"[0-9]+\.[0-9]+\.[0-9]+"' "$VERSION_FILE" \
-        | sed -E 's/^VERSION *= *"([0-9]+\.[0-9]+\.[0-9]+)"/\1/')
-    if [[ -z "$version" ]]; then
-        error "Could not parse version from $VERSION_FILE"
-    fi
-    echo "$version"
-}
-
-next_version() {
-    local current="$1"
-    local bump="$2"
-
-    local major minor patch
-    IFS='.' read -r major minor patch <<< "$current"
-
-    case "$bump" in
-        major) echo "$((major + 1)).0.0" ;;
-        minor) echo "${major}.$((minor + 1)).0" ;;
-        patch) echo "${major}.${minor}.$((patch + 1))" ;;
-        *) error "Invalid BUMP value '$bump'. Must be one of: patch, minor, major" ;;
-    esac
+    uv tool run hatch version 2>/dev/null || error "Could not read version via 'hatch version'"
 }
 
 confirm() {
@@ -114,10 +93,14 @@ cmd_prepare() {
         error "Local master ($local_sha) is not up-to-date with $remote/master ($remote_sha). Run 'git pull' first."
     fi
 
-    # Compute version
+    # Read current version and compute next via hatch
     local current new_version branch_name
     current=$(current_version)
-    new_version=$(next_version "$current" "$bump")
+
+    info "Bumping version ($bump)..."
+    uv tool run hatch version "$bump" >/dev/null 2>&1 \
+        || error "Failed to bump version with 'hatch version $bump'"
+    new_version=$(current_version)
     branch_name="release/${new_version}"
 
     info "Current version: $current"
@@ -125,31 +108,19 @@ cmd_prepare() {
     info "Release branch:  $branch_name"
     echo
 
-    # Check for branch collision
+    # Check for branch collision (restore version if aborting)
     if git show-ref --verify --quiet "refs/heads/$branch_name" 2>/dev/null; then
+        git checkout -- "$VERSION_FILE"
         error "Local branch '$branch_name' already exists. Delete it first: git branch -D $branch_name"
     fi
     if git ls-remote --exit-code "$remote" "refs/heads/$branch_name" &>/dev/null; then
+        git checkout -- "$VERSION_FILE"
         error "Remote branch '$branch_name' already exists on '$remote'. Delete it first: git push $remote --delete $branch_name"
     fi
 
-    # Create branch
+    # Create branch (version file already updated by hatch)
     info "Creating branch '$branch_name'..."
     git checkout -b "$branch_name"
-
-    # Update version file (portable across macOS and Linux)
-    info "Updating $VERSION_FILE to $new_version..."
-    local tmp_file
-    tmp_file=$(mktemp)
-    sed -E "s/^(VERSION *= *\")([0-9]+\.[0-9]+\.[0-9]+)(\")/\1${new_version}\3/" "$VERSION_FILE" > "$tmp_file"
-    mv "$tmp_file" "$VERSION_FILE"
-
-    # Verify the update
-    local written_version
-    written_version=$(current_version)
-    if [[ "$written_version" != "$new_version" ]]; then
-        error "Version file update failed. Expected '$new_version', got '$written_version'."
-    fi
 
     # Commit
     info "Committing version bump..."
