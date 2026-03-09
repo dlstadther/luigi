@@ -1,16 +1,117 @@
-For maintainers of Luigi, who have push access to pypi. Here's how you upload
-Luigi to pypi.
+Release Process
+===============
 
-#. Make sure [uv](https://github.com/astral-sh/uv) is installed ``curl -LsSf https://astral.sh/uv/install.sh | sh``.
-#. Update version number in `luigi/__version__.py`.
-#. Commit, perhaps simply with a commit message like ``Version x.y.z``.
-#. Push to GitHub at [spotify/luigi](https://github.com/spotify/luigi).
-#. Clean up previous distributions by executing ``rm -rf dist``.
-#. Build a source distribution by executing ``uv build``.
-#. Set pypi token on environment variable ``export UV_PUBLISH_TOKEN="LUIGI_PYPI_TOKEN_HERE"``.
-#. Upload to pypi by executing ``uv publish``.
-#. Add a tag on github (https://github.com/spotify/luigi/releases),
-   including a handwritten changelog, possibly inspired from previous notes.
+For maintainers of Luigi who have push access to PyPI.
 
-Currently, Luigi is not released on any particular schedule and it is not
-strictly abiding semantic versioning. Whenever possible, bump major version when you make incompatible API changes, minor version when you add functionality in a backwards compatible manner, and patch version when you make backwards compatible bug fixes.
+Prerequisites
+-------------
+
+- `uv <https://github.com/astral-sh/uv>`_ — Python package manager (build & publish)
+- `gh <https://cli.github.com>`_ — GitHub CLI (PR creation)
+- A PyPI API token with upload permissions for the ``luigi`` package
+
+Workflow
+--------
+
+The release process uses two commands with a manual step in between.
+
+Step 1: Prepare the release
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+From an up-to-date ``master`` branch with a clean working tree::
+
+    make release-prepare BUMP=<patch|minor|major>
+
+This will:
+
+1. Validate prerequisites (correct branch, clean tree, tools installed)
+2. Compute the next version number
+3. Create a ``release/x.y.z`` branch
+4. Update ``luigi/__version__.py``
+5. Commit with the message ``Version x.y.z``
+6. Push the branch and open a PR against ``master``
+
+To push to a remote other than ``origin``::
+
+    make release-prepare BUMP=minor REMOTE=upstream
+
+Step 2: Merge and tag (manual)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+1. Review the PR and wait for CI to pass.
+2. Merge the PR into ``master``.
+3. Create a `GitHub Release <https://github.com/spotify/luigi/releases/new>`_:
+
+   - **Tag:** Use the bare version number (e.g., ``3.9.0``). Do **not** add a ``v`` prefix.
+   - **Title:** The version number (e.g., ``3.9.0``).
+   - **Release notes:** Use GitHub's "Generate release notes" button.
+
+Step 3: Publish to PyPI
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Set your PyPI token and publish::
+
+    export UV_PUBLISH_TOKEN="your-pypi-token"
+    make release-publish
+
+This will:
+
+1. Fetch the latest tags and pull ``master``
+2. Validate: clean working tree, on ``master``, tag exists, version matches, not already on PyPI
+3. Build the package
+4. Show a summary and ask for confirmation
+5. Upload to PyPI
+
+To skip the confirmation prompt (e.g., for scripted use)::
+
+    make release-publish FORCE=1
+
+To retry a partially failed upload::
+
+    FORCE=1 make release-publish
+
+Conventions
+-----------
+
+- **Tags:** Bare version numbers (e.g., ``3.9.0``), no ``v`` prefix
+- **Release branches:** ``release/x.y.z``
+- **Commit message:** ``Version x.y.z``
+
+Environment Variables
+---------------------
+
+``UV_PUBLISH_TOKEN``
+    PyPI API token for uploading. Required for ``release-publish``.
+
+``REMOTE``
+    Git remote to push to during ``release-prepare``. Default: ``origin``.
+
+``FORCE``
+    Set to ``1`` to skip the PyPI existence check and the confirmation prompt.
+    Useful for retrying a partially failed upload.
+
+Troubleshooting
+---------------
+
+**Branch already exists:**
+    If ``release/x.y.z`` already exists from a previous attempt, delete it::
+
+        git branch -D release/x.y.z            # local
+        git push origin --delete release/x.y.z  # remote
+
+**Tag not found during publish:**
+    Ensure you created a GitHub Release with the bare version tag (no ``v`` prefix).
+    The script fetches tags automatically, but if the tag still isn't found, try::
+
+        git fetch --tags
+
+**Version already on PyPI:**
+    If a previous upload partially succeeded, use ``FORCE=1`` to skip the check.
+    Note that PyPI does not allow re-uploading a version that has been fully published.
+
+Versioning
+----------
+
+Luigi is not released on a fixed schedule. When possible, follow semantic
+versioning: bump major for incompatible API changes, minor for new backwards-compatible
+functionality, and patch for backwards-compatible bug fixes.
