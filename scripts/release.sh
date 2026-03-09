@@ -4,6 +4,7 @@ set -euo pipefail
 # Release automation script for Luigi
 # Usage:
 #   ./scripts/release.sh prepare <patch|minor|major> [remote]
+#   ./scripts/release.sh tag
 #   ./scripts/release.sh publish
 
 VERSION_FILE="luigi/__version__.py"
@@ -169,7 +170,7 @@ Bumps version from ${current} to ${new_version} (${bump}).
 
 ## Post-Merge Checklist
 
-- [ ] Create a [GitHub Release](https://github.com/spotify/luigi/releases/new) with tag \`${new_version}\` (no \`v\` prefix) and auto-generated release notes
+- [ ] Run \`make release-tag\` to create a GitHub Release with auto-generated notes
 - [ ] Run \`make release-publish\` to build and upload to PyPI
 EOF
 )
@@ -183,8 +184,41 @@ EOF
     success "Release ${new_version} prepared!"
     info "Next steps:"
     info "  1. Review and merge the PR"
-    info "  2. Create a GitHub Release with tag '${new_version}' (no 'v' prefix)"
+    info "  2. Run 'make release-tag' to create a GitHub Release"
     info "  3. Run 'make release-publish' to publish to PyPI"
+}
+
+cmd_tag() {
+    # Check prerequisites
+    check_tool "gh" "https://cli.github.com"
+    check_on_master
+    check_clean_tree
+
+    # Auto-fetch and pull
+    info "Fetching latest and pulling master..."
+    git fetch --tags
+    git pull
+
+    # Read version
+    local version
+    version=$(current_version)
+    info "Version from $VERSION_FILE: $version"
+
+    # Check tag doesn't already exist
+    if git tag -l "$version" | grep -q "^${version}$"; then
+        error "Tag '$version' already exists. GitHub Release may already have been created."
+    fi
+
+    # Create GitHub Release with auto-generated notes
+    info "Creating GitHub Release for $version..."
+    gh release create "$version" \
+        --title "$version" \
+        --generate-notes \
+        --target master
+
+    echo
+    success "GitHub Release $version created!"
+    info "Next step: Run 'make release-publish' to publish to PyPI"
 }
 
 cmd_publish() {
@@ -274,17 +308,20 @@ cmd_publish() {
 
 case "${1:-}" in
     prepare) shift; cmd_prepare "$@" ;;
+    tag)     shift; cmd_tag "$@" ;;
     publish) shift; cmd_publish "$@" ;;
     *)
-        echo "Usage: $0 <prepare|publish>"
+        echo "Usage: $0 <prepare|tag|publish>"
         echo
         echo "Commands:"
         echo "  prepare <patch|minor|major> [remote]   Bump version, create branch, PR"
+        echo "  tag                                     Create GitHub Release with auto-generated notes"
         echo "  publish                                 Validate, build, publish to PyPI"
         echo
         echo "Examples:"
         echo "  $0 prepare minor              # Bump minor version, push to origin"
         echo "  $0 prepare patch upstream      # Bump patch version, push to upstream"
+        echo "  $0 tag                         # Create GitHub Release for current version"
         echo "  FORCE=1 $0 publish             # Publish, skipping PyPI existence check"
         exit 1
         ;;

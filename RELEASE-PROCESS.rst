@@ -7,13 +7,13 @@ Prerequisites
 -------------
 
 - `uv <https://github.com/astral-sh/uv>`_ — Python package manager (build & publish)
-- `gh <https://cli.github.com>`_ — GitHub CLI (PR creation)
+- `gh <https://cli.github.com>`_ — GitHub CLI (PR creation, release tagging)
 - A PyPI API token with upload permissions for the ``luigi`` package
 
 Workflow
 --------
 
-The release process uses two commands with a manual step in between.
+The release process uses three commands with a manual step after the first.
 
 Step 1: Prepare the release
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -35,18 +35,26 @@ To push to a remote other than ``origin``::
 
     make release-prepare BUMP=minor REMOTE=upstream
 
-Step 2: Merge and tag (manual)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Step 2: Merge (manual)
+~~~~~~~~~~~~~~~~~~~~~~~
 
 1. Review the PR and wait for CI to pass.
 2. Merge the PR into ``master``.
-3. Create a `GitHub Release <https://github.com/spotify/luigi/releases/new>`_:
 
-   - **Tag:** Use the bare version number (e.g., ``3.9.0``). Do **not** add a ``v`` prefix.
-   - **Title:** The version number (e.g., ``3.9.0``).
-   - **Release notes:** Use GitHub's "Generate release notes" button.
+Step 3: Create a GitHub Release
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Step 3: Publish to PyPI
+From an up-to-date ``master`` branch after merging the PR::
+
+    make release-tag
+
+This will:
+
+1. Pull the latest ``master`` and fetch tags
+2. Read the version from ``luigi/__version__.py``
+3. Create a GitHub Release with a bare version tag (e.g., ``3.9.0``) and auto-generated release notes
+
+Step 4: Publish to PyPI
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 Set your PyPI token and publish::
