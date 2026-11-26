@@ -2,220 +2,271 @@
 
 | | |
 |---|---|
-| **Status** | Draft for maintainer review |
+| **Status** | Draft for maintainer review (rev. 2: based on upstream CI data) |
 | **Date** | 2026-11-26 |
-| **Scope** | `test/`, `tox.ini`, `pyproject.toml` (test deps), `.github/workflows/pythonbuild.yml`, `scripts/ci/` |
+| **Baseline** | `spotify/luigi` `master` @ `3e75c0c` (this fork is 30 commits behind; every finding was re-checked on upstream) |
+| **Scope** | `test/`, `tox.ini`, `pyproject.toml`/`uv.lock` (test deps), `.github/workflows/pythonbuild.yml`, `scripts/ci/` |
 | **Non-goals** | 100% coverage in CI; rewriting the suite; a 5-minute end-to-end CI for every integration |
 
 ---
 
 ## 1. Summary
 
-Slow and flaky tests make Luigi hard to maintain and PRs hard to review. I measured
-the suite instead of guessing. The pain comes from a small number of fixable causes,
-not from the size of the suite:
+Revision 1 of this doc was based only on local measurements. Revision 2 adds what
+upstream CI actually does: 326 `Build` runs, per-job timings for three recent `master`
+runs, and the failing jobs of ten failed runs. It also adds a full audit of which tests
+tox and CI actually run.
 
-1. **About 92% of serial `core` time is spent in 47 tests (3% of the suite)**, and most of
-   that time is `sleep()`: retry back-offs, fixed "wait for server" sleeps, and tasks that
-   sleep so another thread has time to act.
-2. **One config default costs 4 minutes locally.** `RemoteScheduler` retries now go through
-   tenacity with `rpc-retry-wait = 30` s. The test hack that used to turn waits off
-   (`self.sch._wait = lambda: None`, `test/server_test.py:296`) no longer does anything.
-   Each of the four `test_404` tests sleeps 2 × 30 s. One line in the test config takes
-   `server_test.py` from **244 s to 3.4 s**.
-3. **Coverage doubles CI time.** `coverage<6` is pinned. On current Pythons it falls back to
-   its pure-Python tracer: **92 s → 48 s** for `core` when moved to coverage 7 with
-   `COVERAGE_CORE=sysmon`, with identical results.
-4. **The confirmed flakes have three known causes** (Luo et al. 2014: async-wait,
-   concurrency, order dependency):
-   - two test files start a real `luigid` on the **same hard-coded port 8082**, and xdist
-     can run them at the same time;
-   - "is the server up yet" is checked with `sleep(0.1)` / `sleep(0.5)`;
-   - assertions check wall-clock time (`assertLess(duration, 4)`);
-   - task-registry state leaks between tests that share an xdist worker.
-5. **Some tests are hidden instead of fixed.** 23 tests are skipped on CI with
-   `skipOnTravisAndGithubActions`, most pointing at dead 2015 Travis job URLs. When I
-   un-skipped them, **14 failed every time: they are broken, not flaky.** One class makes
-   real calls to AWS. As a result, CI and local runs execute different suites.
-6. **The CI matrix has 34 jobs per PR**, and 28 of them run only 12–25 s of tests each.
-   On top of that, `codecov` upload failures fail the build (`fail_ci_if_error: true` in
-   every job), CI has no job timeouts, and new pushes don't cancel the previous run.
+1. **One job sets the wall time of every PR, and the cause is one stale lockfile pin.**
+   Upstream runs take **17–32 min**. In each sampled run, `core (py314-core)` takes
+   **17.5–25.4 min**, while every other one of the 43 jobs finishes in ≤ 6.3 min (most in
+   about 1 min). The reason: `uv.lock` pins **mypy 1.14.1**, which has no compiled wheel
+   for Python 3.14. `test/mypy_test.py` therefore runs mypy *as pure Python*, under
+   *coverage 5.5's pure-Python tracer*, and `--dist=loadfile` puts all 5 of those tests on
+   *one* xdist worker. I reproduced it locally: py314 `core` takes **18m22s**, of which
+   the mypy tests take **1,028s**.
+   - **Bumping mypy to ≥ 1.17 (compiled on 3.14): 1,104s → 117s.**
+   - **Also moving to coverage 7 + `COVERAGE_CORE=sysmon`: → 62s.**
 
-The proposal has four phases. Phase 0 is a handful of small PRs that roughly halve
-`core` CI time and cut local `core` time by 2–8×. Phase 1 removes the known sources of
-flakiness. Phase 2 restructures CI from 34 jobs to about 12 per PR, with a full nightly
-matrix. Phase 3 is ongoing hygiene that keeps the suite fast.
+   This is roughly a **4× cut in PR wall time from a one-line lockfile change**.
+2. **Coverage 5.5 is the next-biggest cost everywhere else.** It only gets its C tracer
+   on 3.10, where it compiles from source; on 3.11–3.14 it falls back to pure Python. That
+   is why `py310-core` takes about 2 min while py311–313 take 4–6 min. Coverage 7 with
+   `sysmon` measured **92s → 48s** for `core` on 3.13.
+3. **CI and local runs skip a lot of tests, in nine different ways** (§3.5). Audited
+   against upstream:
+   - 16 tests selected by no CI env;
+   - 11 test modules (≈90 tests) skipped *at import time*, which is invisible in CI output:
+     - `mongo_test.py` can never run, because the pinned `pymongo 3.4.0` can't be imported
+       on Python ≥ 3.10;
+     - `redis` and `pykube` aren't installed in any group;
+   - 9 tests hidden by `--ignore-glob="**/_*"`;
+   - 3 tests whose nose-style names pytest never collects (dropped silently in the 2021
+     nose→pytest migration);
+   - 18 CI-only skip sites;
+   - **two tox envs, `cdh` and `hdp`, that download Hadoop and then select 0 tests**,
+     because their `minicluster` marker died with snakebite in 2019 (spotify/luigi#2833);
+   - 32 tests that run twice per Python.
+4. **Flakiness exists, but in upstream CI it's hidden rather than hitting PRs.** No
+   re-run attempts are visible in recent history. In the ten failed runs I classified,
+   the visible causes are lint, typecheck, and a PR-caused dependency failure; four are
+   unconfirmable because logs need sign-in or have expired. **None was a Codecov or
+   infra failure.** Locally, though, the CI-skipped tests contain a real flake (two files
+   share hard-coded port 8082; fixed startup sleeps; wall-clock assertions), an
+   order-dependent test, and 14 tests that are simply broken. One of them calls real AWS.
+5. **Small CI hygiene issues.**
+   - All 43 jobs race to save the *same* `setup-uv` cache key. That produces a "Failed to
+     save: Unable to reserve cache… another job may be creating this cache" warning on
+     most jobs, and whichever Python wins writes the cache for everyone.
+   - Every job emits Node 20 deprecation warnings from the Codecov action.
+   - There's no job timeout and no cancellation of superseded runs.
+   - Each run uses **1h13m–1h27m of runner time**.
+
+The proposal is phased. **Phase 0** is a handful of tiny PRs: the mypy bump comes first,
+then coverage 7 and CI hygiene. **Phase 1** fixes the tox/marker design so tests can't
+fall out of CI unnoticed, and fixes the known flake sources. **Phase 2** consolidates CI
+from 43 jobs to about 14 per PR and adds a nightly full matrix. **Phase 3** is ongoing
+hygiene.
 
 ---
 
 ## 2. Method
 
-All numbers were measured on a 4-vCPU Linux container (similar to a GitHub
-`ubuntu-22.04` runner, which has 4 vCPUs), Python 3.13, at commit `0ef6a79` (v3.8.0). The
-fork has no GitHub Actions history, so CI job durations are inferred from local runs
-plus spotify/luigi#3398 ("core takes about 5 minutes and others take about 1 minute or
-less" before xdist; 2–4 min after).
-
-| Experiment | What it shows |
+| Source | What I did |
 |---|---|
-| `core` serial with `--durations` and junit XML | per-test and per-file cost |
-| `core` CI-like (`-n auto --dist=loadfile`, coverage on/off, `GITHUB_ACTIONS=true`) | real CI cost and the coverage overhead |
-| Same with coverage 7 (`ctrace`, `sysmon`) | how much a tracer upgrade saves |
-| `core` 6× (3× at `-n 4`, 3× at `-n 12` oversubscribed) | flakiness in the suite CI actually runs |
-| CI-skipped and timing-sensitive files, 10× (5 idle, 5 with 8 busy-loop processes) | whether hidden tests are flaky or broken |
-| `contrib`, `aws`, `apache`, `scheduler` envs | per-env cost |
-| Cold vs. warm `uv sync` (new cache) on 3.10 and 3.13 | whether dependency install is a bottleneck |
+| Upstream Actions history (public web UI) | Listed 50 recent runs and the first two pages of failed runs; read per-job timings and annotations (the `/usage` and summary pages) for three successful `master` runs (`45747287888`, `45092229826`, `45093235493`) and the failed jobs of ten failed runs. Job logs need sign-in, so failing test names weren't visible. *(The Actions API wasn't available to this session for `spotify/luigi`; everything was read from public pages.)* |
+| Upstream clone @ `3e75c0c` | Collected every test with a plugin that dumps nodeid + markers, then evaluated each tox env's selection (`-m …` expression + path) against it (§3.5). Collected with `-rs` to list import-time module skips. |
+| Local timing (4 vCPU, roughly a GitHub `ubuntu-22.04` runner) | `core` CI-style (`-n auto --dist=loadfile`, `GITHUB_ACTIONS=true`, coverage on) on Python 3.10, 3.13 and 3.14, with and without coverage, with coverage 7 (`ctrace`, `sysmon`), and with mypy 1.14.1 vs 1.18.2. |
+| Local flake hunt | `core` 6× (including 3× oversubscribed). The CI-skipped and timing-sensitive files, un-skipped, 10× (5 idle, 5 under CPU starvation). |
 
-Reproduction commands are in [Appendix A](#appendix-a-reproduction).
+Commands are in [Appendix A](#appendix-a-reproduction).
 
 ---
 
 ## 3. Findings
 
-### 3.1 Where the time goes
+### 3.1 Upstream CI: where the wall-clock time goes
 
-**`core`, serial, no CI skips (what a contributor gets when running the suite locally):**
-391 s, 27 failures.
+**Run history.** The `Build` workflow had **326 runs; 106 (33%) failed.** Of the 49
+most recent completed runs, 8 failed (16%). Successful runs took **16m51s–32m27s**. No
+run shows a re-run attempt.
 
-| File | Serial time | Tests | Main cause |
-|---|---:|---:|---|
-| `server_test.py` | **244.0 s** | 59 | 4 × `test_404` at 60.1 s each = RPC retry back-off (2 × 30 s) |
-| `worker_test.py` | 34.9 s | 107 | tasks that `sleep(1..5)`, worker wait intervals, real DNS lookup of `tld.invalid` |
-| `worker_scheduler_com_test.py` | 18.1 s | 5 | tasks sleep 3 s; test does `t.join(1)` / `t.join(3)` then asserts |
-| `mypy_test.py` | 13.9 s | 5 | runs mypy (actual work, but cacheable or markable as slow) |
-| `rpc_test.py` | 13.2 s | 208 | 4 tests × 2 s of retry waits (`_rpc_retry_wait = 1`) |
-| `scheduler_test.py` | 12.3 s | 22 | `StableDoneCooldownSecsTest`: real `luigid` on :8082 plus sleeps |
-| `task_running_resources_test.py` | 11.2 s | 3 | real `luigid` on :8082, `sleep(0.5)` startup, wall-clock assertions |
-| `custom_metrics_test.py` | 6.0 s | 1 | `time.sleep(n)` in task |
-| everything else | ~37 s | ~1,300 | |
+**Per-job timings**, three successful `master` pushes (43 jobs each):
 
-- **47 tests that take ≥1 s each account for 358 s of the 387 s (92%).**
-- Without `server_test.py` (most of which is skipped on CI), the remaining ~143 s is
-  still mostly sleeps. `scheduler_api_test.py` has 196 tests and needs only 4.1 s;
-  `parameter_test.py` has 160 and needs 3.2 s. Fast tests are the norm here.
+| Job | Run `45747287888` | Run `45092229826` | Run `45093235493` |
+|---|---:|---:|---:|
+| **Wall time** | **24m51s** | **17m39s** | **25m27s** |
+| **`core (py314-core)`** | **24m47s** | **17m34s** | **25m22s** |
+| next-longest job | 5m30s (py311-core) | 6m16s (py312-core) | 5m27s (py311-core) |
+| `core (py311/312/313)` | 5m14s–5m30s | 4m04s–6m16s | 3m41s–5m27s |
+| `core (py310-core)` | 2m33s | 2m09s | 2m50s |
+| `aws` jobs | 1m10s–2m07s | 58s–2m15s | 56s–2m44s |
+| `unixsocket` jobs | 1m27s–4m22s | 1m30s–1m47s | 1m27s–4m21s |
+| `contrib` / `apache` / `azureblob` / `mysql` / `postgres` jobs | 29s–1m22s | 32s–1m07s | 27s–1m25s |
+| `lint` / `typecheck` / `docs` | 9s / 21s / 34s | 11s / 29s / 26s | 13s / 29s / 39s |
+| **Total runner time** | **1h24m10s** | **1h12m51s** | **1h26m35s** |
 
-**`core`, CI-like (`-n auto --dist=loadfile`, `GITHUB_ACTIONS=true`):**
+**Root cause of the py314 outlier** (reproduced locally, `core`, CI-style):
 
-| Configuration | Wall time |
-|---|---:|
-| Current (`coverage==5.5`, pure-Python tracer) | **92 s** |
-| No coverage | 46 s |
-| `coverage 7.x`, `COVERAGE_CORE=ctrace` | 57 s |
-| `coverage 7.x`, `COVERAGE_CORE=sysmon` (PEP 669, Python ≥3.12) | **48 s** |
-| `--dist=worksteal` instead of `loadfile` | 52 s (no gain) |
+| Python | mypy | coverage | `mypy_test.py` (5 tests, one worker) | `core` wall |
+|---|---|---|---:|---:|
+| 3.10 | 1.14.1 (compiled) | 5.5 (C tracer, built from sdist) | ~56s | 111s |
+| 3.14 | 1.14.1 (**pure Python**: no cp314 wheel) | none | ~147s | 181s |
+| 3.14 | 1.14.1 (**pure Python**) | 5.5 (**pure-Python tracer**) | **1,028s** (≈205s each) | **1,104s** |
+| 3.14 | **1.18.2** (compiled) | 5.5 (pure-Python tracer) | 39s | **117s** |
+| 3.14 | **1.18.2** (compiled) | **7.x, `COVERAGE_CORE=sysmon`** | 26s | **62s** |
 
-`coverage 5.5` has no compiled tracer for the Pythons Luigi supports today
-(`coverage.collector.CTracer is None` on 3.13), so every line runs through a Python-level
-trace function. `.coveragerc` also uses `concurrency=multiprocessing` with
-`COVERAGE_PROCESS_START`, which adds the same tracer to every child process. Luigi starts
-child processes constantly: workers, `luigid`, task processes.
+mypy ships compiled (mypyc) wheels for 3.14 starting with 1.17 (1.16.1: pure Python;
+1.17.1, 1.18.2, 2.4.1: compiled, checked by installing each one). `pyproject.toml`
+says only `"mypy"`; the version is held back purely by `uv.lock`. `mypy_test.py` passes
+on 1.18.2.
 
-**Other envs** (CI-like, coverage on):
+The same two factors explain the smaller spread between the other Python versions. py310
+gets coverage's compiled tracer and runs `core` in about 2 min. py311–313 get the
+pure-Python tracer plus compiled mypy, and take 4–6 min.
 
-| Env | Test time |
-|---|---:|
-| `contrib` | 12 s |
-| `aws` | 25 s (10.7 s of it is `test_remove_dir_batch`) |
-| `apache` | 13 s |
-| `scheduler` (not in CI) | 22 s |
+### 3.2 Upstream CI: what makes runs red
 
-**Dependency install is not a bottleneck.** A cold `uv sync --group common` with an empty
-cache took 4 s on 3.13 and 6 s on 3.10, and that includes building the sdist-only pins
-(psutil 3.4.2, pymongo 3.4.0, SQLAlchemy 1.3.24). Per-job overhead in CI therefore comes
-from runner start-up, installing tox, the Python download, `docker pull` for Azurite,
-MySQL init, and the Codecov upload. These are fixed costs per job, so the number of jobs
-matters more than how fast each one is.
+The ten failed runs I classified (job logs need sign-in, so classification is from the
+job list and annotations):
 
-**Collection** takes about 4 s per xdist worker, which is acceptable.
+| Category | Runs | Notes |
+|---|---:|---|
+| `others (lint)` fails in about 8–13s; `typecheck` and `docs` are then cancelled | 4 | deterministic; `lint` failing cancels other `others` jobs via fail-fast |
+| `others (typecheck)` | 1 | deterministic |
+| PR dependency bump breaks nearly every job | 1 | PR-caused |
+| A single `core`/`aws` job fails | 4 | probably real test failures; unconfirmable (logs need sign-in or have expired) |
+| Codecov / Docker / MySQL / timeout | **0** | none seen in annotations |
 
-### 3.2 Flakiness: what I could reproduce, and why
+Older failures include long streaks of 10–15 consecutive failing pushes on a single PR
+(for example spotify/luigi#3427, spotify/luigi#3429). That pattern suggests contributors
+use CI as their test runner, which fits the local-setup friction in §3.6.
 
-The `core` suite that CI runs, with CI skips active, was **deterministic in 6 of 6 runs**,
-including runs at 3× CPU oversubscription. The only two failures appeared every time and
-come from this sandbox: `ssh` isn't installed, and a psutil 3.4 child-wait timeout. In
-other words, today's CI is green mostly *because the flaky tests are skipped*, not
-because they were fixed.
+**Conclusion.** Upstream red builds are mostly real failures. Flakiness is
+*structurally present* (§3.4) but currently kept off PRs by skips. The main maintainer
+pain in CI is **latency**: a 17–30 min feedback loop, entirely due to one job.
 
-When the CI-skipped and timing-sensitive files were un-skipped and run 10×:
+**Annotations seen on green runs:**
+- `setup-uv` "Failed to save: Unable to reserve cache with key
+  `setup-uv-2-x86_64-unknown-linux-gnu-ubuntu-22.04-3.10.12-pruned-<hash>`, another job
+  may be creating this cache". The key contains neither the matrix Python nor `uv.lock`,
+  so **43 jobs with different Python versions and dependency sets share one cache
+  entry**, and the first job to finish decides its contents.
+- "Node.js 20 is deprecated … `actions/github-script@60a0d83…` … forced to run on
+  Node.js 24" (40–77 per run, coming from `codecov/codecov-action@v5`).
+
+### 3.3 Local: where the time goes (non-mypy)
+
+Serial `core` with no CI skips, i.e. what a contributor running the suite gets (fork @
+v3.8.0, same test code as upstream for these files): **391s, 27 failures.**
+
+| File | Serial time | Main cause |
+|---|---:|---|
+| `server_test.py` | **244s** | 4 × `test_404` at 60s each. `rpc-retry-wait` defaults to 30s (`luigi/rpc.py:154`), and the test's `self.sch._wait = lambda: None` (`test/server_test.py:296`) is a dead hack left over from before tenacity |
+| `worker_test.py` | 35s | tasks that `sleep(1..5)`; real DNS lookup of `tld.invalid` (`:1244`) |
+| `worker_scheduler_com_test.py` | 18s | 3s task sleeps plus `t.join(1)`/`t.join(3)` used as synchronization |
+| `mypy_test.py` | 14s (3.13) → 1,028s (3.14, CI) | see §3.1 |
+| `rpc_test.py` | 13s | 4 × 2s retry waits |
+| `scheduler_test.py`, `task_running_resources_test.py` | 12s, 11s | a real `luigid` on hard-coded :8082, `sleep()` for start-up |
+
+- **47 tests that take ≥1s each account for 92% of serial time**, and most of that is
+  sleeps.
+- Adding `rpc-retry-wait: 0` to the test config takes `server_test.py` from **244s to
+  3.4s**.
+- Dependency installation is **not** a bottleneck: a cold `uv sync` takes 4–6s.
+
+### 3.4 Flakiness: reproduced root causes
+
+With CI skips active, `core` was deterministic in 6 of 6 runs, including 3× CPU
+oversubscription. When the CI-skipped and timing-sensitive files were un-skipped, 10×:
 
 | Test(s) | Failure rate | Verdict | Root cause |
 |---|---:|---|---|
-| `task_running_resources_test.py::ConcurrentRunningResourcesTest::test_tasks_parallel` | 7/10 | **Flaky** | `OSError: [Errno 98] Address already in use` on :8082 (collides with `scheduler_test.py` on another xdist worker); `ConnectionRefused` because `sleep(0.5)` wasn't enough for start-up; `assertLess(4.06, 4)` |
-| `…::test_tasks_serial` | 5/10 (only when not under load) | **Flaky** | same port collision; `assertGreater(2.4, 4)` once the scheduler is shared |
-| `worker_test.py::DynamicDependenciesWithMultipleWorkersTest::test_dynamic_dependencies_other_module` | 10/10 in this file grouping, 0/6 in full `core` | **Order-dependent** | `TaskClassNotFoundException: No task OtherModuleTask`: `other_module` was already imported, so its class is never re-registered after the autouse registry reset |
-| `contrib/batch_test.py::BatchClientTest` (10 tests) | 10/10 | **Broken** | `BatchClient.__init__` builds a real boto3 client and calls AWS (`UnrecognizedClientException`). Real network in a unit test. |
-| `contrib/s3_test.py` multipart copy/put (4 tests) | 10/10 | **Broken** | part-size assertions (`16777216 != 16777448`) no longer match moto 4.x |
-| `server_test.py` skipped tests (ping, raw_ping, 404, save_state) | 0/10 | **Fixed by time**, still skipped | skip reasons point at 2015 Travis jobs |
-| `server_test.py::_ServerTest::*` (5) | 5/5 locally | **Collection bug** | abstract base class is collected (`server_client_class = "To be defined…"` → `'str' object is not callable`); needs `__test__ = False` |
+| `task_running_resources_test.py::ConcurrentRunningResourcesTest::test_tasks_parallel` | 7/10 | **Flaky** | `OSError: [Errno 98] Address already in use` on :8082 (`scheduler_test.py` binds it on another xdist worker); `ConnectionRefused` after `sleep(0.5)`; `assertLess(4.06, 4)` |
+| `…::test_tasks_serial` | 5/10 | **Flaky** | same port collision |
+| `worker_test.py::…::test_dynamic_dependencies_other_module` | 10/10 in one file grouping, 0/6 in full `core` | **Order-dependent** | `other_module` was already imported, so `OtherModuleTask` isn't re-registered after the autouse registry reset |
+| `contrib/batch_test.py::BatchClientTest` (10) | 10/10 | **Broken** | `BatchClient.__init__` calls real AWS (`UnrecognizedClientException`) |
+| `contrib/s3_test.py` multipart (4) | 10/10 | **Broken** | part-size expectations don't match moto 4.x |
+| `server_test.py` ping/404/save_state | 0/10 | **Passing, still skipped** | skip reasons point at 2015 Travis jobs |
+| `server_test.py::_ServerTest::*` (5) | 5/5 locally | **Collection bug** | abstract base is collected; needs `__test__ = False` |
 
-Other latent hazards I found by reading code, though they didn't fail in my runs:
+Latent hazards found by reading code:
+- sleep-based thread coordination in `worker_scheduler_com_test.py`;
+- wall-clock assertions in `task_running_resources_test.py`, `contrib/dataproc_test.py`,
+  and `scheduler_api_test.py::test_get_work_speed`;
+- `worker_test.py:1574` `@unittest.skip("Always skip. There are many intermittent failures")`.
 
-- `worker_scheduler_com_test.py` coordinates threads with fixed sleeps: "it should be safe
-  to wait 1 second here… after additional 3 seconds, the worker will have…". This breaks
-  as soon as a CI runner stalls for more than about 1 s.
-- `worker_test.py:1244` resolves `tld.invalid` over real DNS.
-- Assertions on wall-clock time: `task_running_resources_test.py` (`assert_duration`),
-  `contrib/dataproc_test.py` (`assertLess(time.time() - job_start, 3)`),
-  `scheduler_api_test.py::test_get_work_speed` (a performance test inside the unit suite).
-- `test/worker_test.py:1574`: `@unittest.skip("Always skip. There are many intermittent failures")`.
-- **Python 3.14** changes the default `multiprocessing` start method on Linux to
-  `forkserver`. Several tests depend on `fork` semantics: dynamically defined task
-  classes, and `mock.patch` applied in the parent and expected in the child. Luigi
-  doesn't test 3.14 yet, so this is the next wave of breakage.
+The project's history shows flakes have usually been skipped instead of fixed:
+spotify/luigi#1111, spotify/luigi#1156, spotify/luigi#1777, spotify/luigi#1840.
 
-The project's issue history shows the same thing. Flaky tests have usually been
-**skipped instead of fixed**: spotify/luigi#1111, spotify/luigi#1156, spotify/luigi#1777,
-spotify/luigi#1840, and the 23 `skipOnTravisAndGithubActions` markers. Skips build up and
-are almost never removed.
+### 3.5 How tox is used, and why tests don't run in CI
 
-### 3.3 CI pipeline issues that cause red builds or waste time
+**How it works today.** `tox.ini` defines 64 envs (`py{310..314}-{cdh,hdp,core,contrib,apache,aws,gcloud,mysql,postgres,unixsocket,azureblob,dropbox}` + `visualiser`, `docs`, `lint`, `typecheck`). Each test env:
 
-| Issue | Where | Effect |
-|---|---|---|
-| `fail_ci_if_error: true` on 32 Codecov uploads | `pythonbuild.yml` | A Codecov outage, rate limit, or missing token (fork PRs) turns the build red with no test failing. Looks like flakiness to reviewers. |
-| No `timeout-minutes`, no `pytest-timeout` | workflow / tox | A hung `luigid` or child process can keep a job running for up to 6 h (GitHub's default) |
-| No `concurrency: cancel-in-progress` | workflow | each push to a PR queues another 34 jobs while the old ones keep running |
-| 34 jobs/PR (8 envs × 4 Pythons + lint + docs) | workflow | 28 jobs run 12–25 s of tests; the fixed cost per job dominates. Free-tier public repos are capped at 20 concurrent jobs, so this can mean two waves. |
-| `cache-dependency-glob: "pyproject.toml"` | workflow | the cache key ignores `uv.lock`, which pins the actual versions |
-| Azurite started with `docker run -d` and no readiness check; `docker login` uses a Spotify-org secret | `scripts/ci/install_start_azurite.sh` | race between container start-up and the first test; login fails for forks |
-| MySQL started via `/etc/init.d` with `\|\| true` on every setup command | workflow | setup failures are hidden and show up later as confusing test failures |
-| Postgres uses a `services:` container with health checks | workflow | **this already works**; MySQL and Azurite should follow the same pattern |
+- picks a dependency group (`common` for most);
+- runs `test/runtests.py` with a hand-written `-m` expression.
 
-### 3.4 Local developer experience
+`core` is defined *negatively*: `not minicluster and not gcloud and not mysql and …`.
+`contrib` is `test/contrib/ -m "contrib or unmarked"`, where `unmarked` is added by a
+`conftest.py` hook. CI runs 8 of the 12 factors on 5 Pythons, plus the 3 `others`, giving
+43 jobs. Each job installs tox, then runs `uvx --with tox-uv tox run` for one env.
 
-A contributor following `CONTRIBUTING.rst` hits several problems:
+**Every way a test can avoid running in CI** (counted with an `nodeid → markers → env`
+map over all 1,868 tests collected upstream):
 
-- **CONTRIBUTING is out of date.** It references `flake8`, `py38`, Travis, and phantomjs.
-- **Plain `pytest` isn't supported.** The suite needs `LUIGI_CONFIG_PATH`, fake AWS
-  credentials, and an *activated* venv: `bin/luigi` uses `#!/usr/bin/env python`, so 19
+| # | Mechanism | Tests affected | Detail |
+|---|---|---:|---|
+| 1 | **Env never runs in CI** | 16 (`gcloud`) + 25 (`dropbox`) + visualiser | `gcloud` and `dropbox` need real cloud credentials. Remnants of the Travis setup (`test/gcloud-credentials.json.enc`, the unreferenced `scripts/ci/conditional_tox.sh`, `GCS_TEST_*`/`DROPBOX_APP_TOKEN` in `passenv`) are dead. `visualiser` needs selenium 3.0.2 + phantomjs. |
+| 2 | **Env selects nothing** | 0 (env still costs a Hadoop download) | `cdh`/`hdp` run `-m minicluster`. No test has had that marker since the minicluster tests were removed with snakebite (spotify/luigi#2833, 2019). The `cdh`/`hdp` markers are registered but never used. |
+| 3 | **Import-time module skip** (0 items collected, so invisible) | ≈90 in 11 modules | `mongo_test.py` (9): **`pymongo==3.4.0` can't be imported on Python ≥3.10** (`collections.MutableMapping`), so it can never run. `redis_test.py` (2): `redis` isn't in any dependency group. `kubernetes_test.py` (3): `pykube` isn't installed. `esindex_test.py` (6, marked `aws`): needs an Elasticsearch server. `hdfs/webhdfs_client_test.py` (2, marked `apache`): needs `hdfs`, which only the `cdh`/`hdp` groups install. `contrib/test_ssh.py` (11): needs an SSH server. `gcs_test.py` (19), `bigquery_gcloud_test.py` (15), `dataproc_test.py` (9): need GCP. `dropbox_test.py` (25): needs a token. `postgres_with_server_test.py` (4) and `docker_runner_test.py` (7) probably run in CI (where a server or Docker is available) but skip silently locally. |
+| 4 | **Hidden by `--ignore-glob="**/_*"`** | 9 | `test/_mysqldb_test.py` (1), `test/_test_ftp.py` (5), `test/contrib/_webhdfs_test.py` (3). Never run anywhere. |
+| 5 | **Never collected by pytest** (nose naming) | 3 | `import_test.py::import_test` and `::import_luigi_test` (the "every module imports" smoke test) and `server_test.py::patching_test`. nose collected `*_test` methods; pytest only collects `test*`. They were dropped silently in the nose→pytest migration (spotify/luigi#3048). Revived, `import_test` needs one tweak: `mypy.expandtype` can't be imported standalone (an import cycle inside mypy) unless `mypy.main` is imported first. |
+| 6 | **CI-only skips** | 18 sites | `skipOnTravisAndGithubActions` / `skipOnGithubActions` (§3.4). `OVERRIDE_SKIP_CI_TESTS` re-enables them only in `unixsocket`. |
+| 7 | **Selected by no CI env** | 16 | all `gcloud`-marked (`beam_dataflow_test.py` 11, `bigquery_test.py` 4, `bigquery_avro_test.py` 1). These are mocked unit tests that could run in `contrib`, but the `gcloud` marker excludes them from `core` and `contrib` alike. |
+| 8 | **Run twice per Python** | 32 | unmarked tests under `test/contrib/` match both `core` (not excluded) and `contrib` (`or unmarked`) |
+| 9 | **Same venv built repeatedly** | | `apache`, `aws`, `mysql`, `contrib`, `azureblob` and `core` all use the `common` group, yet each is a separate tox env and CI job: 6 identical environments per Python, 30 per run |
+
+**Why this keeps happening.** Selection is a hand-maintained *exclusion list*: `core`'s
+`-m`. Any new marker, or any marker whose env gets dropped, silently removes tests from
+every CI job. Import-time `raise unittest.SkipTest(...)` for missing dependencies turns
+"dependency missing in CI" into "zero tests collected", with no signal. Nothing checks
+that every collected test is selected by at least one CI env.
+
+Also: `DOCKERHUB_TOKEN` is in tox `passenv`, but the workflow never sets it, so
+`install_start_azurite.sh`'s `docker login -u spotifyci` always fails. That's harmless,
+because the image comes from `mcr.microsoft.com`, but it's misleading.
+
+### 3.6 Local developer experience
+
+- `CONTRIBUTING.rst` is out of date: it mentions `flake8`, `py38`, Travis, and phantomjs.
+- Plain `pytest` isn't supported. The suite needs `LUIGI_CONFIG_PATH`, fake AWS creds,
+  and an *activated* venv. `bin/luigi` has `#!/usr/bin/env python`, so 19
   `cmdline_test.py` tests fail unless `.venv/bin` is on `PATH`.
-- **Coverage is always on.** `--cov=luigi --cov-report=xml -vv --fulltrace` is in
-  `[pytest] addopts`, so every local run, even a single test, pays the 2× coverage
-  overhead and produces very verbose output.
-- **The default `uv sync` fails.** The `dev` group needs `psycopg2`, which needs
-  `pg_config`. Contributors have to know about `--no-default-groups --group common`.
-- **There's no fast inner loop.** No `slow` marker exists, so mypy tests, performance
-  tests, and multi-second timing tests run on every invocation.
-- **CI and local runs disagree.** Local runs execute 23 tests that CI skips, and some of
-  those are broken (§3.2). A contributor can't tell whether a red local run is their fault.
+- Coverage, `-vv` and `--fulltrace` are in `[pytest] addopts`, so even a single-test run
+  pays the coverage overhead.
+- The default `uv sync` (`dev` group) needs `pg_config` because of `psycopg2`.
+- There's no `slow` marker for a fast inner loop.
+- Local runs execute tests that CI skips, and some of those are broken, so a red local
+  run doesn't tell a contributor whether they caused it.
 
 ---
 
 ## 4. Prior art
 
-| Source | Takeaway for this proposal |
+| Source | Takeaway |
 |---|---|
-| Luo, Hariri, Eloussi, Marinov, *An Empirical Analysis of Flaky Tests* (FSE 2014) | Top root causes: **async wait (45%)**, **concurrency (20%)**, **test-order dependency (12%)**. All three appear in Luigi (§3.2). Recommended fixes: replace sleeps with explicit synchronization, isolate shared resources, reset global state. |
-| Google Testing Blog, *Flaky Tests at Google and How We Mitigate Them* (2016) | About 1.5% of test runs flaky at Google. Mitigations: **quarantine** flaky tests out of the blocking path, track flake rates, and treat reruns as a temporary measure rather than a fix. |
-| Spotify Engineering, *Test Flakiness – Methods for identifying and dealing with flaky tests* (2019) | Luigi's original authors: measure flakiness centrally, quarantine flaky tests with an owner and a ticket, and remove sleeps and real network calls. |
-| GitHub Engineering, *Reducing flaky builds by 18x* (2020) | Automatically detect flakes on rerun, attribute each flake to an owner, and keep a quarantine with a deadline. |
-| Martin Fowler, *Eradicating Non-Determinism in Tests* (2011) | Asynchrony: **poll with a timeout instead of sleeping**. Time: inject a clock. Isolation: no shared ports or global state. |
-| Tornado `tornado.testing.bind_unused_port` / `AsyncHTTPTestCase.get_http_port()`; CPython `test.support.socket_helper.find_unused_port` | Bind to port 0 and let the OS pick. **Luigi already does this** in `remote_scheduler_test.py:42` and `scheduler_parameter_visibilities_test.py:109`. The two flaky files just don't. |
-| `tenacity`-based polling in `test/lock_test.py:39` | Luigi already has an eventual-consistency assertion pattern in-tree. |
-| coverage.py 7.4+ `COVERAGE_CORE=sysmon` (PEP 669 `sys.monitoring`) | Very low overhead on 3.12+. Measured: 92 s → 48 s here. |
+| Luo et al., *An Empirical Analysis of Flaky Tests* (FSE 2014) | Top causes: async wait (45%), concurrency (20%), order dependency (12%). All three are present here (§3.4). |
+| Google Testing Blog, *Flaky Tests at Google and How We Mitigate Them* (2016) | Quarantine flaky tests out of the blocking path, track flake rates; reruns are a temporary measure, not a fix. |
+| Spotify Engineering, *Test Flakiness – Methods for identifying and dealing with flaky tests* (2019) | From Luigi's original home: measure flakiness centrally, quarantine with an owner, remove sleeps and real network calls. |
+| GitHub Engineering, *Reducing flaky builds by 18x* (2020) | Detect flakes on rerun automatically, attribute them to an owner, quarantine with a deadline. |
+| Martin Fowler, *Eradicating Non-Determinism in Tests* (2011) | Poll with a timeout instead of sleeping; inject the clock; isolate shared resources. |
+| Tornado `bind_unused_port` / `AsyncHTTPTestCase.get_http_port()` | Already used in `remote_scheduler_test.py:42` and `scheduler_parameter_visibilities_test.py:109`; the two flaky files just don't use it. |
+| coverage.py ≥7.4 `COVERAGE_CORE=sysmon` (PEP 669) | Very low overhead on 3.12+. Measured 92s → 48s (3.13) and 117s → 62s (3.14). |
+| mypyc-compiled mypy wheels | Compiled mypy is several times faster than pure Python. On 3.14 that requires mypy ≥1.17. |
 | `pytest-timeout`, `pytest-rerunfailures`, `pytest-randomly`, `pytest-socket` | Standard tools for hangs, quarantined reruns, order-dependency detection, and blocking real network access. |
-| Apache Airflow "selective checks"; GitHub `paths` filters | Run integration jobs only when the relevant `luigi/contrib/*` or `test/contrib/*` files change. Airflow runs a full matrix on `main`/nightly and a reduced one on PRs. |
-| spotify/luigi#3398 (xdist for `core`), spotify/luigi#3346 (Codecov Test Analytics, open) | xdist has already helped. Test Analytics would give us the flake and slow-test tracking that Google, Spotify, and GitHub all recommend, for the cost of one `--junitxml` flag. |
+| tox 4 `labels`; one pytest invocation with an OR-ed marker expression | Run several logical suites in one env/job instead of one job each. |
+| Apache Airflow "selective checks"; GitHub `paths` filters | Reduced matrix on PRs, full matrix on `main`/nightly. |
+| spotify/luigi#3398 (xdist), spotify/luigi#3346 (Codecov Test Analytics, open) | xdist already helped `core`. Test Analytics would add flake and slow-test tracking. |
 
 ---
 
@@ -223,277 +274,239 @@ A contributor following `CONTRIBUTING.rst` hits several problems:
 
 ### Guiding principles
 
-1. **Fix, don't skip.** A skip needs a linked issue and an expiry. A test that can't be
-   fixed gets deleted or rewritten.
+1. **Fix, don't skip.** A skip needs a linked issue and an expiry.
 2. **No sleeps for synchronization.** Use readiness polling, events, or an injected clock.
 3. **Hermetic unit tests.** No fixed ports, no real network, no state shared across tests.
-4. **CI and local run the same suite.** Environment-specific behavior lives in fixtures,
-   not in `if GITHUB_ACTIONS` skips.
-5. **Pay fixed CI costs once.** Fewer, fuller jobs on PRs; the full matrix runs nightly
-   and on `master`.
+4. **Opt-in, not opt-out, selection.** A test runs in CI unless it explicitly says why
+   it can't, and CI verifies that.
+5. **Pay fixed CI costs once.** Fewer, fuller jobs on PRs; the full matrix nightly.
 
-### Phase 0: quick wins (small PRs, no test logic changes)
+### Phase 0: quick wins (tiny PRs, no test logic changes), in priority order
 
-| # | Change | Expected effect | Evidence |
+| # | Change | Effect | Evidence |
 |---|---|---|---|
-| 0.1 | Add `rpc-retry-wait: 0` under `[core]` in `test/testconfig/luigi.cfg`; delete the dead `self.sch._wait = lambda: None` hack and the per-test `_rpc_retry_wait = 1` overrides | `server_test.py` 244 s → 3.4 s; `rpc_test.py` −8 s; `worker_test.py::test_connection_error` −2 s | measured |
-| 0.2 | Bump test deps to `coverage>=7.6` and set `COVERAGE_CORE=sysmon` in tox `setenv` (on 3.10/3.11 coverage warns and falls back to `ctrace`, which is still ~40% faster than today) | `core` CI 92 s → ~48 s, and the same saving in every coverage-enabled env | measured |
-| 0.3 | Add `__test__ = False` to `_ServerTest` | 5 bogus local failures gone | measured |
-| 0.4 | Move `--cov…`, `-vv`, `--fulltrace` out of `addopts` into the tox `commands`. Move the `[pytest]` section to `[tool.pytest.ini_options]`. Default `LUIGI_CONFIG_PATH` and fake AWS creds in `conftest.py` via `os.environ.setdefault` | `uv run pytest test/foo_test.py` works out of the box and runs at full speed | |
-| 0.5 | In `cmdline_test.py`, call `[sys.executable, "bin/luigi", …]` instead of relying on the shebang | 19 local-only failures gone | measured |
-| 0.6 | Add `pytest-timeout` (`timeout = 120`, `timeout_method = thread`) and `timeout-minutes: 20` per job | hangs fail fast with a traceback instead of burning up to 6 h | |
-| 0.7 | Add `concurrency: { group: ${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: ${{ github.event_name == 'pull_request' }} }` | superseded PR runs are cancelled | |
-| 0.8 | Codecov: `fail_ci_if_error: ${{ github.event_name == 'push' }}`, or upload from one aggregate job (§Phase 2) | Codecov outages stop turning PRs red | |
-| 0.9 | `cache-dependency-glob: "uv.lock"` | correct cache invalidation | |
-| 0.10 | Rewrite the testing section of `CONTRIBUTING.rst` (uv, current Python versions, how to run one test, which envs need services) | lower barrier for contributors | |
+| **0.1** | **`uv lock --upgrade-package mypy`** (to ≥1.17, e.g. 1.18.2), and optionally a `"mypy>=1.17"` floor in the `common`/`docs` groups | **py314 `core`: 1,104s → 117s. PR wall time: ~25 min → ~6 min** | measured |
+| 0.2 | Coverage `>=7.6` in test deps and `COVERAGE_CORE=sysmon` in tox `setenv` (3.10/3.11 fall back to `ctrace` with a warning) | py314 `core` 117s → 62s; py313 92s → 48s; py311–313 jobs should drop from 4–6 min towards about 2 min | measured (3.13, 3.14) |
+| 0.3 | Add `rpc-retry-wait: 0` under `[core]` in `test/testconfig/luigi.cfg`; delete the dead `_wait` hack and the per-test `_rpc_retry_wait = 1` overrides | `server_test.py` 244s → 3.4s locally; −10s across `rpc_test`/`worker_test` | measured |
+| 0.4 | `setup-uv`: `cache-dependency-glob: "uv.lock"` + `cache-suffix: ${{ matrix.tox-env }}` | stops 43 jobs racing over one cache entry; caches the right wheels per Python | annotation evidence |
+| 0.5 | `concurrency: {group: ${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: ${{ github.event_name == 'pull_request' }}}`; `timeout-minutes: 20` per job; `pytest-timeout` (`timeout = 300`) | superseded runs cancelled; hangs fail fast | |
+| 0.6 | Bump `codecov/codecov-action` once a Node 24 release is out; set `fail_ci_if_error: ${{ github.event_name == 'push' }}` | removes 40–77 warnings per run; fork PRs aren't blocked by Codecov | |
+| 0.7 | `__test__ = False` on `_ServerTest`; rename the 3 nose-style methods to `test_*` (and fix `import_test` for the mypy import cycle) | +3 real tests, −5 bogus local failures | measured |
+| 0.8 | Delete the dead `cdh`/`hdp` envs, `setup_hadoop_env.sh` usage, `conditional_tox.sh`, the encrypted Travis GCP creds, `DOCKERHUB_TOKEN`/`docker login`, and the unused `minicluster`/`cdh`/`hdp` markers | less to maintain and to misread | §3.5 |
+| 0.9 | Move `--cov…`, `-vv` and `--fulltrace` from `addopts` into the tox `commands`; move `[pytest]` to `[tool.pytest.ini_options]`; default `LUIGI_CONFIG_PATH` and fake AWS creds in `conftest.py`; call `sys.executable` in `cmdline_test.py` | `uv run pytest test/x_test.py` works out of the box | measured |
+| 0.10 | Rewrite the testing section of `CONTRIBUTING.rst` | lower barrier for contributors | |
 
-**Phase 0 result.** Local serial `core` drops from about 391 s to about 150 s, or about
-48 s with `-n auto`. CI `core` drops from about 92 s to about 48 s per Python version.
-Infra-caused red builds go away.
+**Phase 0 result.** PR wall time drops from 17–30 min to about 5–6 min (the longest
+remaining jobs are py311–313 `core` under coverage 5.5; 0.2 shortens them further).
+Runner time per run drops by roughly 20 min.
 
-### Phase 1: remove the known sources of flakiness
+### Phase 1: make test selection trustworthy, and fix the flakes
 
-**1.1 A shared `luigid` fixture.** Replace the hand-rolled
-`multiprocessing.Process(target=luigi.server.run)` + `sleep()` in
-`scheduler_test.py:348`, `task_running_resources_test.py:77`, and `server_test.py:291`
-with one helper in `test/helpers.py`:
+**1.1 Replace the exclusion list with an explicit `integration` concept.** In
+`conftest.py`, add an `integration` mark to any item carrying a service marker (`mysql`,
+`postgres`, `azureblob`, `unixsocket`, `gcloud`, `dropbox`, …). Then:
 
-```python
-@contextmanager
-def running_luigid(**server_kwargs):
-    sock, port = tornado.testing.bind_unused_port()   # OS-assigned, no collisions
-    sock.close()
-    proc = multiprocessing.Process(target=luigi.server.run,
-                                   kwargs=dict(api_port=port, address="127.0.0.1", **server_kwargs))
-    proc.start()
-    wait_until(lambda: _port_open("127.0.0.1", port), timeout=10)   # readiness, not sleep
-    try:
-        yield port
-    finally:
-        proc.terminate(); proc.join(5)
-        if proc.is_alive():
-            proc.kill(); proc.join()
+```ini
+core:        pytest -m "not integration"
+integration: pytest -m "integration and (aws or apache or contrib or unixsocket or …)"
 ```
 
-The code under test then gets `--scheduler-port`/`RemoteScheduler(f"http://127.0.0.1:{port}")`.
-This removes the confirmed `Address already in use` / `ConnectionRefused` flakes and the
-startup sleeps. (Binding and closing has a tiny TOCTOU window; if it ever shows up, pass
-the pre-bound socket to tornado via `add_sockets`.)
+With this, a new marker can't silently fall out of `core`. Fold `contrib`, `aws` and
+`apache` into `core` wherever they're fully mocked: they all use the `common` group today
+and run in 12–25s. Re-mark the 16 mocked `gcloud` unit tests (`beam_dataflow_test.py`,
+`bigquery_test.py`, `bigquery_avro_test.py`) so they run in `core`; only tests that need
+real GCP credentials keep `gcloud`.
 
-**1.2 A `wait_until(predicate, timeout, interval=0.01)` helper** (or reuse `tenacity`,
-which is already used in `lock_test.py`). Use it to replace sleeps that exist only to
-synchronize:
+**1.2 A CI "selection audit".** A small script (≈40 lines) runs
+`pytest --collect-only` with a plugin that dumps nodeid + markers, evaluates every CI
+env's selection, and **fails if a test is selected by no CI env** unless it carries an
+explicit `@pytest.mark.manual(reason=…)`. It should also fail on **unexpected
+import-time skips**: in CI, set an env var that makes a missing optional dependency
+raise instead of `SkipTest` (or check `-rs` output against an allowlist of reasons such
+as "needs Elasticsearch"). This turns all nine mechanisms in §3.5 into visible failures.
 
-- `worker_scheduler_com_test.py`: poll `self.w.worker_processes == 2` instead of
-  `t.join(1); …; t.join(3)`. Shorten the task sleep from 3 s to a `threading.Event` the
-  test releases.
-- `scheduler_test.py::StableDoneCooldownSecsTest`: wait on the scheduler's task state,
-  not on `time_to_run_secs + time_to_check_secs`.
-- `custom_metrics_test.py`, `worker_test.py` `sleep(5)`/`sleep(1)` tasks: use events, or
-  shrink the duration and set `worker_timeout`/`wait_interval` to match.
+**1.3 Resolve the dead and hidden tests**, one PR each:
 
-**1.3 Remove wall-clock assertions.** `ConcurrentRunningResourcesTest` should check *what
-happened* (task B started before task A finished, using recorded timestamps or the
-scheduler's `running` set), not `duration < 4`. Move `test_get_work_speed` and
-`test_quadratic_behavior` to a `@pytest.mark.perf` suite that runs nightly.
+| Tests | Action |
+|---|---|
+| `mongo_test.py` | bump `pymongo` (3.4.0 → current); runs in `core` with mocks or with a `mongo` service |
+| `redis_test.py`, `kubernetes_test.py` | add the dependencies to `common`, or delete the tests if the contrib modules are unmaintained |
+| `hdfs/webhdfs_client_test.py` | add `hdfs` to `common` (it's tiny), or delete |
+| `esindex_test.py` | it's marked `aws` by mistake; give it an `elasticsearch` service marker plus a nightly service job, or `manual` |
+| `_mysqldb_test.py`, `_test_ftp.py`, `_webhdfs_test.py` | rename and fix, or delete |
+| 18 CI-only skips | un-skip (`server_test` passes), fix (`batch_test`: patch `boto3.client`/`moto.mock_batch`; `s3_test` multipart: update for moto), or delete. Then remove `skipOnTravisAndGithubActions`, `_running_on_travis` and `OVERRIDE_SKIP_CI_TESTS`. |
+| `gcloud`/`dropbox` real-service tests | decide: a nightly job with org secrets, or `manual` |
 
-**1.4 Isolate global state.** Make `reset_luigi_registry` in `test/conftest.py` also
-`sys.modules.pop()` the helper modules tests import dynamically (`other_module`,
-`auto_namespace_test`, etc.), or have those tests use `temporary_unloaded_module`, which
-already exists in `test/helpers.py`. Run `pytest -p randomly` nightly (Phase 2) to find
-the next order dependency.
+**1.4 A shared `running_luigid` fixture** (in `test/helpers.py`) that binds an
+OS-assigned port (`tornado.testing.bind_unused_port`), starts the server, and **polls
+for readiness** instead of sleeping. Use it in `scheduler_test.py`,
+`task_running_resources_test.py` and `server_test.py`. This removes the confirmed
+`Address already in use` / `ConnectionRefused` flake.
 
-**1.5 Audit every CI skip.** Each of the 23 `skipOnTravisAndGithubActions` /
-`skipOnGithubActions` sites ends in one of three ways:
+**1.5 A `wait_until(pred, timeout)` helper** (or `tenacity`, already used in
+`lock_test.py`) to replace sleeps used for synchronization:
+`worker_scheduler_com_test.py`, `StableDoneCooldownSecsTest`, `custom_metrics_test.py`,
+and the `worker_test.py` sleep tasks.
 
-- **Un-skip.** It passes now; the `server_test.py` ping/404/save_state tests are proven
-  to pass 10/10.
-- **Fix.** `batch_test.py`: patch `boto3.client` before constructing `BatchClient`, or use
-  `moto.mock_batch`. `s3_test.py` multipart: update expectations for moto 4, or assert
-  part counts rather than byte sizes.
-- **Delete.** If nobody can explain what the test protects, remove it.
+**1.6 Remove wall-clock assertions.** Assert on the order of events instead. Move
+`test_get_work_speed`/`test_quadratic_behavior` to `@pytest.mark.perf` (nightly).
 
-Then delete `skipOnTravisAndGithubActions`, `_running_on_travis`, and
-`OVERRIDE_SKIP_CI_TESTS` from `helpers.py`, `tox.ini`, and the workflow.
+**1.7 Isolate global state.** Have the registry-reset fixture also drop dynamically
+imported helper modules (`other_module`, …), or use the existing
+`temporary_unloaded_module`.
 
-**1.6 Block real network access in unit tests** with `pytest-socket`
-(`--disable-socket --allow-hosts=127.0.0.1,localhost,::1`) in the `core` and `contrib`
-envs. That would have caught `batch_test.py` (real AWS) and `worker_test.py:1244` (real
-DNS). Integration envs (`mysql`, `postgres`, `azureblob`, `gcloud`, `dropbox`) opt out.
+**1.8 Block real network access** in `core` with `pytest-socket` (allow localhost). It
+would have caught `batch_test.py` (real AWS) and `worker_test.py:1244` (real DNS).
 
-**1.7 A quarantine policy, not a crutch.** Add `pytest-rerunfailures`, but **don't**
-enable `--reruns` globally. A test confirmed flaky that can't be fixed right away gets
-`@pytest.mark.flaky(reruns=2)` **and** a linked issue, and is listed in
-`test/QUARANTINE.md`. A quarantined test that isn't fixed within, say, two releases gets
-deleted. Every rerun is reported, so a hidden flake stays visible.
+**1.9 A quarantine policy.** `pytest-rerunfailures` *only* for tests listed in
+`test/QUARANTINE.md` with an issue link, and an expiry of two releases.
 
-### Phase 2: restructure CI
+**1.10 Run `mypy_test.py` once, not 5× per run.** It tests the mypy *plugin*, not
+Luigi's runtime behavior on each Python. Move it to the `typecheck` env (single Python),
+or mark it `slow` and run it on one Python in CI. This also makes `core` independent of
+how fast mypy is on the newest Python.
 
-**Current: 34 jobs per PR.**
+### Phase 2: restructure CI (43 → about 14 jobs per PR)
 
-```
-core × 4 Pythons
-mysql × 4
-postgres × 4
-{aws, unixsocket, apache, azureblob, contrib} × 4
-lint
-docs
-```
+| Job | Pythons | Contents |
+|---|---|---|
+| `lint`, `typecheck` | 3.13 | unchanged (seconds). Don't let `lint` cancel `typecheck`/`docs` (`fail-fast: false` on `others`), so contributors see every problem in one round. |
+| `core` | 3.10–3.14 | `-m "not integration"` (now including mocked `contrib`/`aws`/`apache`/`gcloud`), xdist, coverage sysmon |
+| `services` | 3.10, 3.14 | `mysql`, `postgres`, `azureblob`, `unixsocket` in **one** job, with MySQL and Azurite as `services:` containers with health checks (as Postgres already is). This replaces init.d MySQL and the `docker run` Azurite race. |
+| `docs` | 3.13 | path-filterable |
+| `coverage` | | combine artifacts, **one** Codecov upload + junit for Test Analytics (spotify/luigi#3346); informational |
+| `selection-audit` | 3.13 | §1.2; seconds |
 
-**Proposed for PRs: about 12 jobs.**
-
-| Job | Pythons | Contents | Why |
-|---|---|---|---|
-| `lint` | 3.13 | `ruff check`, `ruff format --check` | seconds; fail fast |
-| `core` | 3.10, 3.11, 3.12, 3.13 | `core` with xdist + coverage (sysmon on ≥3.12) | ~1 min each after Phase 0; keeps the per-version signal where most logic lives |
-| `integration` | 3.10, 3.13 | `tox run -e pyXY-contrib,pyXY-aws,pyXY-apache,pyXY-unixsocket` in **one job** | each env is 12–25 s; pays the fixed per-job cost once instead of four times |
-| `services` | 3.10, 3.13 | `mysql`, `postgres`, `azureblob` in one job, with all three as `services:` containers with health checks | removes init.d MySQL, the `docker run` Azurite race, and the Docker Hub login |
-| `docs` | 3.13 | Sphinx | unchanged; could be path-filtered to `doc/**`, `luigi/**` |
-| `coverage` | | downloads coverage artifacts from all jobs, `coverage combine`, **one** Codecov upload + junit for Test Analytics (spotify/luigi#3346) | one upload instead of 32; failure isolated to one non-blocking job |
-
-**Nightly (`schedule`) and on push to `master`:**
-- the full Python × env matrix (what runs today);
-- **Python 3.14** (catches the `forkserver` change early; §3.2);
-- `pytest -p randomly` on `core` (order-dependency detection);
-- `@pytest.mark.perf` and `@pytest.mark.slow` tests;
-- optionally `cdh`/`hdp`/`gcloud`/`dropbox`, which today never run in CI. They should
-  either get a nightly job or have their tests explicitly marked as manual-only.
-
-**Optional, later: selective PR checks** using `paths` /
-[`dorny/paths-filter`](https://github.com/dorny/paths-filter). Skip `integration` and
-`services` when a PR touches only `doc/**`, or only `luigi/contrib/<x>.py` that no
-integration env covers. This is Airflow's approach. It's a lower priority because, after
-Phase 0 and Phase 2, the full PR set should already finish in a few minutes.
-
-**Required checks** become `lint`, `core (3.10..3.13)`, `integration`, and `services`.
-`coverage` is informational.
+**Nightly and on push to `master`:** the full Python × env matrix; `pytest -p randomly`;
+`perf`/`slow` tests; jobs that use credentials (`gcloud`, `dropbox`) if the org provides
+secrets; an auto-filed issue on failure.
 
 ### Phase 3: keep it fast (ongoing)
 
-- **A `slow` marker plus a fast local default.** Mark `mypy_test.py`, the perf tests, and
-  anything over 1 s that can't be fixed. Document `pytest -m "not slow" -n auto` as the
-  inner loop.
-- **A durations budget in CI.** Add `--durations=25` to CI output so regressions are
-  visible in the log. Optionally have a nightly job fail if any single unit test exceeds
-  5 s without a `slow` marker.
-- **Modernize test dependencies** (each one also removes a source compile or a
-  deprecation-warning flood; 798–1,852 warnings per `core` run today):
-  `mock<2.0` → `unittest.mock`; `psutil<4.0` → current; `moto<5` → `moto>=5` (`mock_aws`);
-  `HTTPretty==0.8.10` → `responses` (already a dependency); `boto` 2 removal; `selenium==3.0.2`.
-- **Gradual migration to pytest style.** New tests use pytest fixtures (`tmp_path`,
-  `monkeypatch`, the `running_luigid` fixture). Existing `unittest.TestCase` tests are
-  converted only when touched. No big-bang rewrite.
-- **Track flake rate** in Codecov Test Analytics. Review the top-5 flaky and top-5 slow
-  tests once per release.
+- A `slow` marker plus `pytest -m "not slow" -n auto` as the documented inner loop.
+- `--durations=25` in CI logs; nightly fails if a unit test takes over 5s without `slow`.
+- Modernize the very old pins. Each one is a source of compile time, warnings, or dead
+  tests: `pymongo==3.4.0`, `psutil<4.0`, `mock<2.0`, `moto<5`, `HTTPretty==0.8.10`,
+  `sqlalchemy<1.4`, `selenium==3.0.2`, `coverage<6`, `boto` 2.
+- **Let Renovate/Dependabot update `uv.lock`.** The root cause of §3.1 is a lockfile that
+  quietly fell behind a new Python. Dependabot supports `uv` lockfiles.
+- Migrate to pytest style gradually: new tests use fixtures; old tests convert when they
+  are touched.
+- Review the top-5 flaky and top-5 slow tests (Codecov Test Analytics) once per release.
 
 ---
 
 ## 6. Expected impact
 
-| Metric | Today | After Phase 0 | After Phases 1–2 |
+| Metric | Today (upstream) | After Phase 0 | After Phases 1–2 |
 |---|---:|---:|---:|
-| Local `core`, serial, no CI skips | 391 s, 27 failures | ~150 s, 0–3 failures† | < 60 s‡ |
-| Local `core`, `-n auto` | ~92 s (coverage always on) | ~48 s | ~20–25 s‡ |
-| CI `core` job test step | ~92 s | ~48 s | ~25 s‡ |
-| Jobs per PR | 34 | 34 | ~12 |
-| Tests skipped only on CI | 23 | 23 | 0 |
-| Known structural flake sources | port collisions, startup sleeps, wall-clock assertions, registry leaks, Codecov upload, hangs without timeout | Codecov and hangs fixed | all addressed |
+| PR wall time (successful run) | **17–32 min** | **~5–6 min** | ~3–4 min‡ |
+| Longest job | py314-core 17.5–25.4 min | ~2–5 min | ~2 min‡ |
+| Runner time per run | 1h13m–1h27m | ~50–60 min‡ | ~25 min‡ |
+| Jobs per PR | 43 | 43 | ~14 |
+| Tests never run in CI (§3.5 #1–#7) | ≈150+ | ≈145 | 0 unexplained (rest marked `manual` with a reason) |
+| Local `core`, serial, no CI skips | 391s, 27 failures | ~150s, 0–3 failures | < 60s‡ |
+| Known flake sources | ports, sleeps, wall-clock, registry leak | unchanged | addressed |
 
-† Measured: 8 failures with only 0.1 applied (5 of them fixed by 0.3, 2 caused by this
-sandbox, 1 is the `ConcurrentRunningResourcesTest` flake fixed in 1.1).
-‡ Estimates: after removing synchronization sleeps, the ≥1 s tests that remain are mostly
-mypy runs and genuine multiprocess tests.
+‡ estimates. Everything else is measured or read from upstream CI.
 
 ---
 
 ## 7. Risks and trade-offs
 
-- **Fewer Pythons for integration envs on PRs.** A 3.11/3.12-only regression in
-  `contrib` would be caught nightly instead of on the PR. Luigi is pure Python, and
-  `core` still runs on all four versions, so I think the risk is low. The nightly job
-  should open an issue automatically on failure so these don't go unnoticed.
-- **`pytest-socket` may break tests that have quietly relied on network access.** Those
-  are exactly the tests we want to find. Roll it out on `core` first.
-- **The coverage 5 → 7 upgrade** may shift some percentages (for example, better branch
-  detection), so codecov targets may need a one-time adjustment.
-- **Un-skipping old tests** may expose real bugs in Luigi, not only in the tests. Triage
-  them as bugs.
-- **Phase 1 changes test code**, so it carries more review burden. Small PRs, one file or
-  one pattern each, keep it reviewable.
+- **Bumping mypy** could change what the plugin sees. `mypy_test.py` passes on 1.18.2,
+  but the `typecheck` env (`mypy luigi/`) may report new errors, which might need fixing
+  in the same PR.
+- **The coverage 5 → 7 upgrade** may shift percentages; codecov targets may need a
+  one-time adjustment.
+- **Folding mocked `contrib`/`aws`/`apache` into `core`** means a broken optional
+  dependency fails `core`. That's intended, since they're already in `common`.
+- **Fewer Pythons for service jobs on PRs.** Covered by the nightly full matrix and its
+  auto-filed issue.
+- **The selection audit and un-skipping** will expose broken tests, and possibly real
+  bugs. Budget for triage.
+- **`pytest-socket`** will flag tests that quietly use the network. Roll it out on
+  `core` first.
 
 ## 8. Open questions for maintainers
 
-1. Are you comfortable running integration envs on only min/max Python on PRs, with the
-   full matrix nightly?
-2. Should Codecov stay a required check, or become informational?
-3. `cdh`/`hdp`/`gcloud`/`dropbox`/`visualiser` envs never run in CI today. Should they be
-   revived nightly, or retired (with `codecov.yml` ignores kept)?
-4. Should we adopt Codecov Test Analytics (spotify/luigi#3346) for flake tracking, or keep
-   tracking in GitHub issues?
-5. Quarantine expiry: is "two releases, then delete" acceptable?
+1. Are you comfortable folding the mocked `contrib`/`aws`/`apache` suites into `core`?
+2. `gcloud`/`dropbox` real-service tests: is there appetite for org secrets in a nightly
+   job, or should they be `manual`?
+3. Untested contrib modules (`mongodb`, `redis_store`, `kubernetes`, `esindex`, webhdfs):
+   revive their tests, or deprecate the modules?
+4. Should Codecov stay a required check, or become informational?
+5. Adopt Codecov Test Analytics (spotify/luigi#3346), and Dependabot for `uv.lock`?
+6. Quarantine expiry: is "two releases, then delete" acceptable?
 
 ## 9. Suggested PR sequence
 
-1. Phase 0.1 + 0.3 (test config + `_ServerTest`): tiny, highest local payoff.
-2. Phase 0.2 (coverage 7 + sysmon).
-3. Phase 0.6–0.9 (workflow hygiene: timeouts, concurrency, Codecov, cache key).
-4. Phase 0.4–0.5 + 0.10 (plain-`pytest` local experience + CONTRIBUTING).
-5. Phase 1.1 (`running_luigid` fixture), then 1.2–1.3 one file at a time.
-6. Phase 1.5 skip audit (one PR per file) → remove skip helpers.
-7. Phase 1.4, 1.6, 1.7.
-8. Phase 2 workflow restructure + nightly.
-9. Phase 3 ongoing.
+1. **mypy lockfile bump** (0.1): one line, about −20 min per PR.
+2. Coverage 7 + sysmon (0.2) and `rpc-retry-wait: 0` (0.3).
+3. Workflow hygiene (0.4–0.6).
+4. Dead envs and scripts (0.8), nose-named tests + `_ServerTest` (0.7).
+5. Local DX + CONTRIBUTING (0.9–0.10).
+6. `integration` marker + selection audit (1.1–1.2), then resolve the dead tests (1.3),
+   one PR per module.
+7. `running_luigid`, `wait_until`, wall-clock and state fixes (1.4–1.7).
+8. Network blocking, quarantine, and moving `mypy_test` (1.8–1.10).
+9. CI restructure + nightly (Phase 2).
+10. Phase 3, ongoing.
 
 ---
 
 ## Appendix A: Reproduction
 
 ```bash
-uv sync --no-default-groups --group common
-export PATH=$PWD/.venv/bin:$PATH LUIGI_CONFIG_PATH=$PWD/test/testconfig/luigi.cfg \
-       AWS_DEFAULT_REGION=us-east-1 AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x LC_ALL=C.UTF-8
+git clone https://github.com/spotify/luigi && cd luigi
+export LUIGI_CONFIG_PATH=$PWD/test/testconfig/luigi.cfg AWS_DEFAULT_REGION=us-east-1 \
+       AWS_ACCESS_KEY_ID=accesskey AWS_SECRET_ACCESS_KEY=secretkey LC_ALL=C.UTF-8 \
+       GITHUB_ACTIONS=true COVERAGE_PROCESS_START=$PWD/.coveragerc
 M='not minicluster and not gcloud and not mysql and not postgres and not unixsocket and not contrib and not apache and not aws and not azureblob and not dropbox'
 
-# Serial per-test durations (local experience)
-python test/runtests.py --doctest-modules -m "$M" --durations=60 --no-cov
+# py314-core as CI runs it (mypy 1.14.1 from uv.lock, coverage 5.5): ~18 min
+UV_PROJECT_ENVIRONMENT=.venv-3.14 uv sync --python 3.14 --no-default-groups --group common
+PATH=$PWD/.venv-3.14/bin:$PATH python test/runtests.py --doctest-modules -m "$M" -n auto --dist=loadfile --durations=15
 
-# CI-like
-GITHUB_ACTIONS=true COVERAGE_PROCESS_START=$PWD/.coveragerc \
-  python test/runtests.py --doctest-modules -m "$M" -n auto --dist=loadfile
+# Is mypy compiled?
+.venv-3.14/bin/python -c "import mypy,os; print(any(f.endswith('.so') for f in os.listdir(os.path.dirname(mypy.__file__))))"
 
-# Coverage 7 comparison
-uv pip install "coverage>=7.6"
-GITHUB_ACTIONS=true COVERAGE_CORE=sysmon COVERAGE_PROCESS_START=$PWD/.coveragerc \
-  python test/runtests.py --doctest-modules -m "$M" -n auto --dist=loadfile
+# Fix 1: compiled mypy (~2 min)
+uv pip install --python .venv-3.14 "mypy==1.18.2"
+PATH=$PWD/.venv-3.14/bin:$PATH python test/runtests.py --doctest-modules -m "$M" -n auto --dist=loadfile
 
-# server_test with retry wait disabled (copy luigi.cfg, add `rpc-retry-wait: 0` under [core])
-LUIGI_CONFIG_PATH=/path/to/fast.cfg python test/runtests.py test/server_test.py --no-cov -k "not _ServerTest and not UNIX"
+# Fix 2: + coverage 7 with sys.monitoring (~1 min)
+uv pip install --python .venv-3.14 "coverage>=7.6"
+COVERAGE_CORE=sysmon PATH=$PWD/.venv-3.14/bin:$PATH python test/runtests.py --doctest-modules -m "$M" -n auto --dist=loadfile
 
-# Flake hunt: CI-skipped + timing-sensitive files, unskipped, repeated
-for i in $(seq 10); do
-  python test/runtests.py test/task_running_resources_test.py test/scheduler_test.py \
-    test/worker_test.py test/server_test.py test/contrib/s3_test.py test/contrib/batch_test.py \
-    -n 4 --dist=loadfile --no-cov -q
-done
+# Import-time module skips (invisible in normal output)
+python -m pytest --collect-only -q --no-cov -rs | grep ^SKIPPED
+
+# Nose-named methods pytest never collects
+grep -rnE "^\s+def [a-z_]+_test\(self" test --include=*.py
 ```
+
+The selection map (§3.5) was produced with a 6-line plugin that writes
+`{"id": item.nodeid, "marks": [...]}` for every item in `pytest_collection_finish`,
+followed by evaluating each tox env's `-m` expression and path against it. That's the
+same approach proposed for the CI selection audit (§1.2).
 
 ## Appendix B: Raw measurements
 
 | Run | Result |
 |---|---|
-| `core` serial, no CI skips | 27 failed / 1473 passed / 38 skipped, 391.6 s |
-| `core` CI-like, coverage 5.5 | 2 failed\* / 1467 passed / 57 skipped, 91.5 s |
-| `core` CI-like, no coverage | same counts, 45.6 s |
-| `core` CI-like, coverage 7.17 ctrace | same counts, 56.2 s |
-| `core` CI-like, coverage 7.17 sysmon | same counts, 47.0 s |
-| `core` CI-like ×6 (`-n 4` ×3, `-n 12` ×3) | identical 2 failures\* each run; 42–46 s |
-| `server_test.py` with `rpc-retry-wait: 0` | 54 passed, 3.4 s (vs 244 s) |
-| Stress, 10 iterations (5 idle + 5 with 8 busy loops) | 14–16 failures per iteration; breakdown in §3.2 |
-| `contrib` / `aws` / `apache` / `scheduler` | 12.4 s / 24.6 s / 12.9 s / 22.1 s |
-| `uv sync --group common` cold (empty cache) | 4 s (3.13), 6 s (3.10) |
-| Collection (`--collect-only`, all tests) | 4.2 s |
+| Upstream `Build` history | 326 runs, 106 failed; successful runs 16m51s–32m27s |
+| Upstream per-job (3 runs) | see §3.1; py314-core 24m47s / 17m34s / 25m22s |
+| Local py310 `core`, cov 5.5 (C tracer) | 1514 passed, 111s |
+| Local py314 `core`, no coverage, mypy 1.14.1 | 181s (mypy tests ≈29s each) |
+| Local py314 `core`, cov 5.5, mypy 1.14.1 | **1,104s** (mypy tests ≈205s each) |
+| Local py314 `core`, cov 5.5, mypy 1.18.2 | **117s** |
+| Local py314 `core`, cov 7 sysmon, mypy 1.18.2 | **62s** |
+| Local py313 `core`, cov 5.5 / none / cov 7 ctrace / cov 7 sysmon | 92s / 46s / 57s / 48s |
+| Local `server_test.py` with `rpc-retry-wait: 0` | 3.4s (vs 244s) |
+| Local `contrib` / `aws` / `apache` / `scheduler` | 12s / 25s / 13s / 22s |
+| `uv sync --group common` cold | 4s (3.13), 6s (3.10) |
+| Collected tests (upstream, `common` deps) | 1,868; 24 module-level skips |
 
-\* `test_ssh.py::…test_check_output_fail_connect` (no `ssh` binary in the sandbox) and
-`worker_task_test.py::…test_cleanup_children_on_terminate` (psutil 3.4 child-wait timeout
-in the container). Both are environment-specific and failed in every run, not
-intermittently.
+Every local `core` run also had 2 environment-specific failures (no `ssh` binary; psutil
+3.4 child-wait timeout in the container). Both are deterministic, not intermittent.
