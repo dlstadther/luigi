@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft for maintainer review (rev. 2: based on upstream CI data) |
+| **Status** | Draft for maintainer review (rev. 3: category-preserving test selection; no nightly perf suite) |
 | **Date** | 2026-11-26 |
 | **Baseline** | `spotify/luigi` `master` @ `3e75c0c` (this fork is 30 commits behind; every finding was re-checked on upstream) |
 | **Scope** | `test/`, `tox.ini`, `pyproject.toml`/`uv.lock` (test deps), `.github/workflows/pythonbuild.yml`, `scripts/ci/` |
@@ -64,8 +64,10 @@ tox and CI actually run.
 
 The proposal is phased. **Phase 0** is a handful of tiny PRs: the mypy bump comes first,
 then coverage 7 and CI hygiene. **Phase 1** fixes the tox/marker design so tests can't
-fall out of CI unnoticed, and fixes the known flake sources. **Phase 2** consolidates CI
-from 43 jobs to about 14 per PR and adds a nightly full matrix. **Phase 3** is ongoing
+fall out of CI unnoticed: `core` becomes a path, and each contrib test gets exactly one
+category, still reported as its own check. It also fixes the known flake sources.
+**Phase 2** trims CI from 43 jobs to about 26 per PR, keeping `core` on every Python and
+one check per category, and adds a nightly full matrix. **Phase 3** is ongoing
 hygiene.
 
 ---
@@ -302,25 +304,36 @@ Runner time per run drops by roughly 20 min.
 
 ### Phase 1: make test selection trustworthy, and fix the flakes
 
-**1.1 Replace the exclusion list with an explicit `integration` concept.** In
-`conftest.py`, add an `integration` mark to any item carrying a service marker (`mysql`,
-`postgres`, `azureblob`, `unixsocket`, `gcloud`, `dropbox`, …). Then:
+**1.1 Make `core` a path, and give every contrib test exactly one category.** The goals:
 
-```ini
-core:        pytest -m "not integration"
-integration: pytest -m "integration and (aws or apache or contrib or unixsocket or …)"
-```
+- `core` stays its own first-class suite, because it's what every Luigi user depends on.
+- A failure still says *which* category broke ("gcloud failed", not "integration
+  failed").
+- No test can fall out of CI unnoticed.
 
-With this, a new marker can't silently fall out of `core`. Fold `contrib`, `aws` and
-`apache` into `core` wherever they're fully mocked: they all use the `common` group today
-and run in 12–25s. Re-mark the 16 mocked `gcloud` unit tests (`beam_dataflow_test.py`,
-`bigquery_test.py`, `bigquery_avro_test.py`) so they run in `core`; only tests that need
-real GCP credentials keep `gcloud`.
+The test tree is already almost organized this way. Of 1,868 tests, every
+category-marked test except 5 lives under `test/contrib/`, and no test carries two
+categories.
+
+| Rule | How |
+|---|---|
+| **`core` = everything outside `test/contrib/`** | `pytest test --ignore=test/contrib` replaces the hand-maintained `not minicluster and not gcloud and not …` expression. A new category can never remove tests from `core`, and `core` can't accidentally pick up contrib tests. |
+| **Every test under `test/contrib/` has exactly one category marker** (`contrib`, `aws`, `apache`, `gcloud`, `mysql`, `postgres`, `azureblob`, `dropbox`, plus new ones as modules need them) | A `pytest_collection_modifyitems` hook in `conftest.py` *errors* when a contrib test has zero or more than one category. This replaces the `unmarked` auto-marker, and with it the 32 tests that run in both `core` and `contrib` today (`datadog_metric`, `external_daily_snapshot`, `hadoop_jar`, `hive`, `pai`, `presto` need a marker). |
+| **Each category keeps its own tox env and CI check** | `pyXY-<category>`: `pytest test/contrib -m <category>`, with that category's dependency group. When it fails, the check name says which category. |
+| **Tests that need real external resources are flagged separately from their category** | e.g. `@pytest.mark.gcloud` + `@pytest.mark.requires_credentials`. The 16 *mocked* `gcloud` tests (`beam_dataflow_test.py`, `bigquery_test.py`, `bigquery_avro_test.py`) can then run in a `gcloud` CI job with the `gcloud` dependency group, while tests that need a real GCP project are excluded explicitly instead of the whole category disappearing from CI. The same applies to `dropbox`. |
+| **`unixsocket`** | The only category outside `test/contrib/` (5 tests in `server_test.py`, testing a `luigid` feature with an extra dependency). Either move it into `core` by adding `requests-unixsocket` to the core dependencies, or keep it as a category and let the audit (1.2) allow-list it. |
+
+This also lines up with the earlier idea of splitting each `contrib` module into its own
+package. Each category is already a self-contained test directory + marker + dependency
+group + CI check, so a future split would mostly move files rather than untangle
+selection logic. Nothing here commits to that split.
 
 **1.2 A CI "selection audit".** A small script (≈40 lines) runs
 `pytest --collect-only` with a plugin that dumps nodeid + markers, evaluates every CI
 env's selection, and **fails if a test is selected by no CI env** unless it carries an
-explicit `@pytest.mark.manual(reason=…)`. It should also fail on **unexpected
+explicit `@pytest.mark.requires_credentials`/`@pytest.mark.manual(reason=…)`. With 1.1
+in place the rule is simple: each test belongs to `core` *xor* exactly one category, and
+each category is either in the CI matrix or explicitly listed as not run. It should also fail on **unexpected
 import-time skips**: in CI, set an env var that makes a missing optional dependency
 raise instead of `SkipTest` (or check `-rs` output against an allowlist of reasons such
 as "needs Elasticsearch"). This turns all nine mechanisms in §3.5 into visible failures.
@@ -348,8 +361,24 @@ for readiness** instead of sleeping. Use it in `scheduler_test.py`,
 `worker_scheduler_com_test.py`, `StableDoneCooldownSecsTest`, `custom_metrics_test.py`,
 and the `worker_test.py` sleep tasks.
 
-**1.6 Remove wall-clock assertions.** Assert on the order of events instead. Move
-`test_get_work_speed`/`test_quadratic_behavior` to `@pytest.mark.perf` (nightly).
+**1.6 Remove wall-clock assertions.** In `ConcurrentRunningResourcesTest` and
+`dataproc_test.py`, assert on the order of events (task B started before task A
+finished) instead of `duration < 4`.
+
+`scheduler_api_test.py::test_get_work_speed` and `test_quadratic_behavior` are a
+different case. They guard against real past regressions (the "almost 4 minutes" `get_work`
+slowdown reported in spotify/luigi#986, and quadratic scheduling), so they stay in `core`
+rather than moving to a separate performance suite. Make them robust instead:
+
+- assert on **scaling, not absolute time**: run at N and 4N and check that the time
+  ratio stays well below quadratic. Or count calls/iterations with a patched helper,
+  which is fully deterministic.
+- shrink N to the smallest size that still separates linear from quadratic behavior.
+  `test_get_work_speed` currently builds 200,000 tasks: 5s with no coverage, 24s under
+  CI's py314 coverage.
+
+A dedicated nightly performance job isn't proposed. It should earn its place, for
+example if a performance regression ever gets past these guard tests.
 
 **1.7 Isolate global state.** Have the registry-reset fixture also drop dynamically
 imported helper modules (`other_module`, …), or use the existing
@@ -366,20 +395,33 @@ Luigi's runtime behavior on each Python. Move it to the `typecheck` env (single 
 or mark it `slow` and run it on one Python in CI. This also makes `core` independent of
 how fast mypy is on the newest Python.
 
-### Phase 2: restructure CI (43 → about 14 jobs per PR)
+### Phase 2: restructure CI (43 → about 26 jobs per PR, one check per category)
 
-| Job | Pythons | Contents |
+A note on what job count does and doesn't buy. Jobs run in parallel, so **cutting jobs
+mostly saves runner minutes and cache contention, not wall time**. The wall-time win comes
+from Phase 0 (one slow job). That leaves room to keep one visible check per category:
+
+| Job | Pythons on PRs | Contents |
 |---|---|---|
 | `lint`, `typecheck` | 3.13 | unchanged (seconds). Don't let `lint` cancel `typecheck`/`docs` (`fail-fast: false` on `others`), so contributors see every problem in one round. |
-| `core` | 3.10–3.14 | `-m "not integration"` (now including mocked `contrib`/`aws`/`apache`/`gcloud`), xdist, coverage sysmon |
-| `services` | 3.10, 3.14 | `mysql`, `postgres`, `azureblob`, `unixsocket` in **one** job, with MySQL and Azurite as `services:` containers with health checks (as Postgres already is). This replaces init.d MySQL and the `docker run` Azurite race. |
+| **`core`** | **3.10–3.14 (all)** | `pytest test --ignore=test/contrib`, xdist, coverage sysmon. The most important signal, so it keeps the full Python matrix. |
+| `<category>` (`contrib`, `aws`, `apache`, `gcloud` (mocked), `unixsocket`, `azureblob`, `mysql`, `postgres`) | oldest + newest (3.10, 3.14) | one job per category, as today: `pytest test/contrib -m <category>`. Check names stay `aws (py310)`, `gcloud (py314)`, etc. MySQL and Azurite become `services:` containers with health checks (as Postgres already is), replacing the init.d MySQL setup and the `docker run` Azurite race. |
 | `docs` | 3.13 | path-filterable |
-| `coverage` | | combine artifacts, **one** Codecov upload + junit for Test Analytics (spotify/luigi#3346); informational |
+| `coverage` | | combine artifacts, **one** Codecov upload + junit for Test Analytics (spotify/luigi#3346), tagged by category so flaky/slow reports are grouped the same way; informational |
 | `selection-audit` | 3.13 | §1.2; seconds |
 
-**Nightly and on push to `master`:** the full Python × env matrix; `pytest -p randomly`;
-`perf`/`slow` tests; jobs that use credentials (`gcloud`, `dropbox`) if the org provides
-secrets; an auto-filed issue on failure.
+That's 5 `core` + 16 category + 5 other ≈ **26 jobs**, down from 43, with every
+category still reported on its own. If runner minutes ever matter more than check
+names, a fallback is one job per Python with **one step per category** (with
+`if: ${{ !cancelled() }}` so every step runs). The failing category is then visible as a
+step name in the job, at about 12 jobs total.
+
+**Nightly and on push to `master`:**
+- every category on every Python (the full matrix);
+- `pytest -p randomly` on `core` (order-dependency detection);
+- `slow` tests, if any;
+- credential-requiring jobs (`gcloud`, `dropbox`) if the org provides secrets;
+- an auto-filed issue on failure.
 
 ### Phase 3: keep it fast (ongoing)
 
@@ -402,8 +444,8 @@ secrets; an auto-filed issue on failure.
 |---|---:|---:|---:|
 | PR wall time (successful run) | **17–32 min** | **~5–6 min** | ~3–4 min‡ |
 | Longest job | py314-core 17.5–25.4 min | ~2–5 min | ~2 min‡ |
-| Runner time per run | 1h13m–1h27m | ~50–60 min‡ | ~25 min‡ |
-| Jobs per PR | 43 | 43 | ~14 |
+| Runner time per run | 1h13m–1h27m | ~50–60 min‡ | ~30–35 min‡ |
+| Jobs per PR | 43 | 43 | ~26 (one check per category kept) |
 | Tests never run in CI (§3.5 #1–#7) | ≈150+ | ≈145 | 0 unexplained (rest marked `manual` with a reason) |
 | Local `core`, serial, no CI skips | 391s, 27 failures | ~150s, 0–3 failures | < 60s‡ |
 | Known flake sources | ports, sleeps, wall-clock, registry leak | unchanged | addressed |
@@ -419,10 +461,12 @@ secrets; an auto-filed issue on failure.
   in the same PR.
 - **The coverage 5 → 7 upgrade** may shift percentages; codecov targets may need a
   one-time adjustment.
-- **Folding mocked `contrib`/`aws`/`apache` into `core`** means a broken optional
-  dependency fails `core`. That's intended, since they're already in `common`.
-- **Fewer Pythons for service jobs on PRs.** Covered by the nightly full matrix and its
-  auto-filed issue.
+- **Path-based `core`** requires moving the 5 `unixsocket` tests (or allow-listing them)
+  and adding markers to 32 unmarked contrib tests. Both are small and mechanical, and the
+  collection hook enforces the rule from then on.
+- **Running categories on only the oldest and newest Python on PRs** could miss a
+  regression specific to a middle version in, say, `aws`. `core` still runs on all
+  versions, and the nightly full matrix catches the rest.
 - **The selection audit and un-skipping** will expose broken tests, and possibly real
   bugs. Budget for triage.
 - **`pytest-socket`** will flag tests that quietly use the network. Roll it out on
@@ -430,14 +474,17 @@ secrets; an auto-filed issue on failure.
 
 ## 8. Open questions for maintainers
 
-1. Are you comfortable folding the mocked `contrib`/`aws`/`apache` suites into `core`?
-2. `gcloud`/`dropbox` real-service tests: is there appetite for org secrets in a nightly
-   job, or should they be `manual`?
-3. Untested contrib modules (`mongodb`, `redis_store`, `kubernetes`, `esindex`, webhdfs):
+1. `unixsocket`: move into `core` (adding `requests-unixsocket` to the core
+   dependencies), or keep it as a category?
+2. Category jobs on PRs: oldest + newest Python (≈26 jobs, one check per category), or
+   one job per Python with a step per category (≈12 jobs)?
+3. `gcloud`/`dropbox` real-service tests: is there appetite for org secrets in a nightly
+   job, or should they stay `requires_credentials` (not run in CI)?
+4. Untested contrib modules (`mongodb`, `redis_store`, `kubernetes`, `esindex`, webhdfs):
    revive their tests, or deprecate the modules?
-4. Should Codecov stay a required check, or become informational?
-5. Adopt Codecov Test Analytics (spotify/luigi#3346), and Dependabot for `uv.lock`?
-6. Quarantine expiry: is "two releases, then delete" acceptable?
+5. Should Codecov stay a required check, or become informational?
+6. Adopt Codecov Test Analytics (spotify/luigi#3346), and Dependabot for `uv.lock`?
+7. Quarantine expiry: is "two releases, then delete" acceptable?
 
 ## 9. Suggested PR sequence
 
@@ -446,9 +493,10 @@ secrets; an auto-filed issue on failure.
 3. Workflow hygiene (0.4–0.6).
 4. Dead envs and scripts (0.8), nose-named tests + `_ServerTest` (0.7).
 5. Local DX + CONTRIBUTING (0.9–0.10).
-6. `integration` marker + selection audit (1.1–1.2), then resolve the dead tests (1.3),
-   one PR per module.
-7. `running_luigid`, `wait_until`, wall-clock and state fixes (1.4–1.7).
+6. Path-based `core` + one-category-per-contrib-test hook + selection audit (1.1–1.2),
+   then resolve the dead tests (1.3), one PR per module.
+7. `running_luigid`, `wait_until`, wall-clock assertions, performance guard tests rewritten
+   to check scaling, and state fixes (1.4–1.7).
 8. Network blocking, quarantine, and moving `mypy_test` (1.8–1.10).
 9. CI restructure + nightly (Phase 2).
 10. Phase 3, ongoing.
